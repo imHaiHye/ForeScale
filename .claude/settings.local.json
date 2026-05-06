@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew bootRun)",
+      "PowerShell(Get-Command *)",
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(Head *)",
+      "PowerShell(Invoke-WebRequest -Uri \"https://github.com/gradle/gradle/raw/v8.11.0/gradle/wrapper/gradle-wrapper.jar\" -OutFile \"C:\\\\Users\\\\chico\\\\source\\\\viral-guard-backend-fixed\\\\viral-guard-backend\\\\gradle\\\\wrapper\\\\gradle-wrapper.jar\" -UseBasicParsing; Write-Output \"다운로드 완료: $\\(\\(Get-Item 'C:\\\\Users\\\\chico\\\\source\\\\viral-guard-backend-fixed\\\\viral-guard-backend\\\\gradle\\\\wrapper\\\\gradle-wrapper.jar'\\).Length\\) bytes\")",
+      "PowerShell(curl.exe -X POST http://localhost:8080/api/v1/alerts/scale-out -H \"Content-Type: application/json\" -d '{\\\\\"model_type\\\\\": \\\\\"CPU\\\\\", \\\\\"predicted_value\\\\\": 91.0, \\\\\"threshold\\\\\": 85.0, \\\\\"predicted_at\\\\\": \\\\\"2024-01-15T14:23:00Z\\\\\"}')"
+    ]
+  }
+}
