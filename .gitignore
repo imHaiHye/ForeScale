@@ -6,3 +6,16 @@ build/
 *.iml
 out/
 *.log
+
+# Python
+ai/venv/
+ai/__pycache__/
+ai/**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+ai/.env
+
+/bin/
+application.yml
