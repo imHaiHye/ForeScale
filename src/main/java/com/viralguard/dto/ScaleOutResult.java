@@ -4,47 +4,67 @@ import java.time.Instant;
 import java.util.List;
 
 /**
- * boto3 스크립트 실행 결과를 담는 불변 레코드.
+ * Scale-out 실행 결과를 담는 불변 레코드.
  *
  * ScaleOutExecutor → ScaleOutHistoryService로 전달되어 이력 기록에 사용됨.
+ * Week 3: C팀 이벤트 수신 구조로 변경, newInstanceId/vmName/privateIp 필드 추가.
  */
 public record ScaleOutResult(
 
-        /** 트리거 요청 정보 */
         String modelType,
         String sourceInstanceId,
 
-        /** 실행 결과 */
         Status status,
         int exitCode,
         long durationMs,
 
-        /** 스크립트 출력 (마지막 20줄) */
         List<String> stdoutLines,
         List<String> stderrLines,
 
-        /** 실패 사유 (null = 성공) */
         String failureReason,
 
-        /** 실행 시각 */
         Instant startedAt,
-        Instant finishedAt
+        Instant finishedAt,
+
+        // C팀으로부터 수신한 신규 VM 정보
+        String newInstanceId,
+        String vmName,
+        String privateIp
 
 ) {
     public enum Status {
-        /** 스크립트 exitCode 0으로 정상 완료 */
         SUCCESS,
-        /** exitCode 0이 아님 */
         FAILED,
-        /** timeoutSeconds 초과로 강제 종료 */
         TIMEOUT,
-        /** ProcessBuilder 자체 실행 실패 (파일 없음, 권한 없음 등) */
         LAUNCH_ERROR,
-        /** Mock 모드 성공 시뮬레이션 */
         MOCK_SUCCESS
     }
 
     // ── 정적 팩토리 ────────────────────────────────────────────
+
+    public static ScaleOutResult fromEvent(ScaleOutEventDTO event) {
+        Instant executedAt;
+        try {
+            executedAt = Instant.parse(event.getExecutedAt());
+        } catch (Exception e) {
+            executedAt = Instant.now();
+        }
+        return new ScaleOutResult(
+                event.getTrigger().getModelType(),
+                event.getSourceInstanceId(),
+                Status.SUCCESS,
+                0,
+                0L,
+                List.of(),
+                List.of(),
+                null,
+                executedAt,
+                Instant.now(),
+                event.getScaleOutResult().getInstanceId(),
+                event.getScaleOutResult().getVmName(),
+                event.getScaleOutResult().getPrivateIp()
+        );
+    }
 
     public static ScaleOutResult success(
             String modelType, String instanceId,
@@ -55,7 +75,8 @@ public record ScaleOutResult(
                 modelType, instanceId,
                 Status.SUCCESS, exitCode, durationMs,
                 stdout, stderr, null,
-                startedAt, Instant.now()
+                startedAt, Instant.now(),
+                null, null, null
         );
     }
 
@@ -68,7 +89,8 @@ public record ScaleOutResult(
                 modelType, instanceId,
                 Status.FAILED, exitCode, durationMs,
                 stdout, stderr, reason,
-                startedAt, Instant.now()
+                startedAt, Instant.now(),
+                null, null, null
         );
     }
 
@@ -79,7 +101,8 @@ public record ScaleOutResult(
                 modelType, instanceId,
                 Status.TIMEOUT, -1, durationMs,
                 List.of(), List.of(), "Script execution timed out",
-                startedAt, Instant.now()
+                startedAt, Instant.now(),
+                null, null, null
         );
     }
 
@@ -90,7 +113,8 @@ public record ScaleOutResult(
                 modelType, instanceId,
                 Status.LAUNCH_ERROR, -1, 0,
                 List.of(), List.of(), reason,
-                startedAt, Instant.now()
+                startedAt, Instant.now(),
+                null, null, null
         );
     }
 
@@ -101,7 +125,8 @@ public record ScaleOutResult(
                 Status.MOCK_SUCCESS, 0, 3000,
                 List.of("[MOCK] EC2 created", "[MOCK] ALB registered", "[MOCK] file_sd.json updated"),
                 List.of(), null,
-                now.minusSeconds(3), now
+                now.minusSeconds(3), now,
+                null, null, null
         );
     }
 
