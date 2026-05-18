@@ -1,9 +1,10 @@
 """
 FastAPI 서버 (최종 통합본)
+# v4.0.0 — B안 확정: FastAPI 직접 실행 + D팀 결과 통보
 
 엔드포인트:
   GET  /health              - 헬스 체크
-  POST /predict             - CPU + Traffic 병렬 예측 + 급격 감지 + 자동 알람 전송
+  POST /predict             - CPU + Traffic 병렬 예측 + 급격 감지 + 자동 scale-out
 
 핵심 흐름 (한 번의 /predict 호출):
   1. 입력으로 받은 최근 시계열 데이터로 Prophet 두 모델 학습
@@ -11,8 +12,9 @@ FastAPI 서버 (최종 통합본)
   3. SpikeDetector로 직전 1분 변화율 30%↑ 체크 (병행)
   4. 결과 통합:
         any_trigger = (Prophet_CPU 위험) OR (Prophet_Traffic 위험) OR (Spike 감지)
-  5. any_trigger=True면 D팀 Spring Boot로 자동 알람 POST 전송
-  6. 응답 반환
+  5. any_trigger=True면 provisioner.scale_out() 직접 호출
+  6. scale-out 완료 후 D팀 Spring Boot로 결과 통보 POST 전송
+  7. 응답 반환
 
 실행:
     uvicorn main:app --host 0.0.0.0 --port 8000
@@ -21,18 +23,22 @@ FastAPI 서버 (최종 통합본)
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional
-from datetime import datetime
 import logging
 import pandas as pd
 
 import sys
 import os
 # ai/ 디렉토리를 path에 추가
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+_AI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
+sys.path.insert(0, _AI_DIR)
+# ForeScale 루트(recovery/ 등)를 path에 추가 (ai-vm 기준 /home/ubuntu/ForeScale/)
+_ROOT_DIR = os.path.join(_AI_DIR, '..')
+sys.path.insert(0, _ROOT_DIR)
 
 from model.predictor import Predictor
 from model.spike_detector import SpikeDetector
 from api.alert_sender import AlertSender
+from recovery.provisioner import scale_out
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -163,34 +169,20 @@ def predict(req: PredictRequest):
 
     logger.info(f'[/predict] any_trigger={any_trigger} | {reason_text}')
 
-    # ---- 4) 위험 시 D팀에 자동 알람 전송 ----
+    # ---- 4) 위험 시 직접 scale_out() 호출 → 완료 후 D팀 결과 통보 ----
     alerts_sent = []
     if any_trigger:
-        # Prophet 트리거 → D팀에 POST (spec에 맞춰 model_type별로)
-        alerts_sent = sender.send_from_predictor_result(
-            pred_result,
-            source_instance_id=req.source_instance_id,
-        )
-        # Spike도 알람 전송 (Prophet과 별개로)
-        # → Spike만 잡고 Prophet은 정상인 경우에도 D팀에 알려야 함
-        if cpu_spike['spike'] and not pred_result['cpu']['trigger']:
-            alerts_sent.append(sender.send_one(
-                model_type='CPU',
-                predicted_value=cpu_spike['current'],
-                threshold=CONFIG['cpu_threshold'],
-                predicted_at=datetime.utcnow(),
+        try:
+            scale_out_result = scale_out(reason=reason_text)
+            logger.info(f'[/predict] scale_out completed: {scale_out_result}')
+            alerts_sent = [sender.notify(
+                pred_result=pred_result,
+                scale_out_result=scale_out_result,
                 source_instance_id=req.source_instance_id,
-                severity='CRITICAL',  # 급격 변화는 항상 CRITICAL
-            ))
-        if traffic_spike['spike'] and not pred_result['traffic']['trigger']:
-            alerts_sent.append(sender.send_one(
-                model_type='TRAFFIC',
-                predicted_value=traffic_spike['current'],
-                threshold=CONFIG['traffic_threshold'],
-                predicted_at=datetime.utcnow(),
-                source_instance_id=req.source_instance_id,
-                severity='CRITICAL',
-            ))
+            )]
+        except Exception as e:
+            logger.error(f'[/predict] scale_out failed: {e}')
+            alerts_sent = [{'status': 'SCALE_OUT_FAILED', 'reason': str(e)}]
 
     # ---- 5) 응답 ----
     return PredictResponse(
