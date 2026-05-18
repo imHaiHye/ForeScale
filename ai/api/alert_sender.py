@@ -3,7 +3,7 @@ Alert Sender — D팀(황준하) Spring Boot로 결과 통보
 # v4.0.0 — B안 확정: FastAPI 직접 실행 + D팀 결과 통보
 
 D팀 새 스펙(api-spec-for-cteam.md v4) 기준:
-  - POST http://10.0.2.40:8080/api/v1/scale-out/event
+  - POST http://10.0.2.40:8080/api/v1/alerts/scale-out
   - 필수 필드: event_type, trigger.model_type, scale_out_result.instance_id, source_instance_id
   - 응답: 200=SUCCESS, 4xx/5xx=ERROR, 네트워크 에러=NETWORK_ERROR
 
@@ -11,7 +11,7 @@ D팀 새 스펙(api-spec-for-cteam.md v4) 기준:
   C팀이 직접 provisioner.scale_out()을 호출하고 완료 후 D팀에 알림
 
 사용:
-    sender = AlertSender(d_team_url='http://10.0.2.40:8080/api/v1/scale-out/event')
+    sender = AlertSender(d_team_url='http://10.0.2.40:8080/api/v1/alerts/scale-out')
     result = sender.notify(pred_result, scale_out_result, source_instance_id='i-xxx')
 """
 
@@ -28,7 +28,7 @@ class AlertSender:
 
     def __init__(
         self,
-        d_team_url: str = 'http://10.0.2.40:8080/api/v1/scale-out/event',
+        d_team_url: str = 'http://10.0.2.40:8080/api/v1/alerts/scale-out',
         timeout_sec: float = 5.0,
     ):
         self.url = d_team_url
