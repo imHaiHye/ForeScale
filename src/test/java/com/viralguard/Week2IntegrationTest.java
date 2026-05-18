@@ -13,13 +13,13 @@ import static org.springframework.test.web.servlet.result.MockMvcResultHandlers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 /**
- * Week 2 신규 엔드포인트 통합 테스트.
+ * 신규 엔드포인트 통합 테스트.
  *
  * 검증:
  *   GET /api/v1/scale-out/history  → 200 + 배열
  *   GET /api/v1/scale-out/latest   → 404 (이력 없음) or 200
  *   GET /api/v1/scale-out/stats    → 200 + total/success/failed/avgDurationMs
- *   Mock 모드 알람 수신 후 이력에 기록됨
+ *   이벤트 수신 후 이력에 기록됨
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -28,14 +28,25 @@ class Week2IntegrationTest {
     @Autowired
     private MockMvc mockMvc;
 
-    private static final String ALERT_JSON = """
+    private static final String EVENT_JSON = """
             {
-                "model_type": "CPU",
-                "predicted_value": 91.5,
-                "threshold": 85.0,
-                "predicted_at": "2024-01-15T14:23:00Z",
-                "source_instance_id": "i-0week2test",
-                "severity": "CRITICAL"
+                "event_type": "SCALE_OUT_COMPLETED",
+                "trigger": {
+                    "model_type": "CPU",
+                    "predicted_value": 91.5,
+                    "threshold": 85.0,
+                    "predicted_at": "2026-05-18T14:20:00Z",
+                    "severity": "CRITICAL",
+                    "reason": "predicted exceeds threshold"
+                },
+                "scale_out_result": {
+                    "instance_id": "i-0week2test",
+                    "private_ip": "10.0.2.100",
+                    "vm_name": "forescale-recovery-week2",
+                    "status": "provisioned"
+                },
+                "source_instance_id": "i-03512866b1c1ba03e",
+                "executed_at": "2026-05-18T14:20:05Z"
             }
             """;
 
@@ -62,9 +73,8 @@ class Week2IntegrationTest {
     }
 
     @Test
-    @DisplayName("아무 실행 없을 때 latest → 404")
-    void getLatest_noHistory_shouldReturn404() throws Exception {
-        // 이력이 없을 때 (다른 테스트에서 기록했을 수 있으므로 케이스 분기)
+    @DisplayName("아무 실행 없을 때 latest → 404 or 200")
+    void getLatest_noHistory_shouldReturn404Or200() throws Exception {
         mockMvc.perform(get("/api/v1/scale-out/latest"))
                 .andDo(print())
                 .andExpect(result -> {
@@ -74,39 +84,20 @@ class Week2IntegrationTest {
     }
 
     @Test
-    @DisplayName("TRAFFIC 모델 알람 수신 → 200 OK + TRIGGERED")
-    void receiveTrafficAlert_shouldReturn200() throws Exception {
-        String trafficJson = """
-                {
-                    "model_type": "TRAFFIC",
-                    "predicted_value": 52428800.0,
-                    "threshold": 41943040.0,
-                    "predicted_at": "2024-01-15T15:00:00Z",
-                    "source_instance_id": "i-0traffic001",
-                    "severity": "WARNING"
-                }
-                """;
-
+    @DisplayName("이벤트 수신 → 200 OK + RECEIVED")
+    void receiveEvent_shouldReturn200Received() throws Exception {
         mockMvc.perform(post("/api/v1/alerts/scale-out")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(trafficJson))
+                        .content(EVENT_JSON))
                 .andDo(print())
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.status").value("TRIGGERED"));
+                .andExpect(jsonPath("$.status").value("RECEIVED"))
+                .andExpect(jsonPath("$.instance_id").value("i-0week2test"));
     }
 
     @Test
-    @DisplayName("Cooldown 상태 API → active 필드 포함")
-    void cooldownStatus_shouldIncludeActiveField() throws Exception {
-        mockMvc.perform(get("/api/v1/status/cooldown"))
-                .andDo(print())
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.active").isBoolean());
-    }
-
-    @Test
-    @DisplayName("ScaleOutResult 상태 상수 검증")
-    void scaleOutResult_statusValues_shouldBeCorrect() {
+    @DisplayName("ScaleOutResult SUCCESS 상태 검증")
+    void scaleOutResult_successStatus_shouldBeCorrect() {
         var mockSuccess = com.viralguard.dto.ScaleOutResult.mockSuccess("CPU", "i-001");
         assert mockSuccess.isSuccess();
         assert mockSuccess.status() == com.viralguard.dto.ScaleOutResult.Status.MOCK_SUCCESS;
