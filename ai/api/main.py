@@ -1,141 +1,127 @@
 """
 FastAPI 서버 (최종 통합본)
-# v4.0.0 — B안 확정: FastAPI 직접 실행 + D팀 결과 통보
-
-엔드포인트:
-  GET  /health              - 헬스 체크
-  POST /predict             - CPU + Traffic 병렬 예측 + 급격 감지 + 자동 scale-out
-
-핵심 흐름 (한 번의 /predict 호출):
-  1. 입력으로 받은 최근 시계열 데이터로 Prophet 두 모델 학습
-  2. 3분 뒤 예측 → 임계치 비교
-  3. SpikeDetector로 직전 1분 변화율 30%↑ 체크 (병행)
-  4. 결과 통합:
-        any_trigger = (Prophet_CPU 위험) OR (Prophet_Traffic 위험) OR (Spike 감지)
-  5. any_trigger=True면 provisioner.scale_out() 직접 호출
-  6. scale-out 완료 후 D팀 Spring Boot로 결과 통보 POST 전송
-  7. 응답 반환
-
-실행:
-    uvicorn main:app --host 0.0.0.0 --port 8000
+# v5.2.0 — threading 스케줄러 + Prometheus + Pushgateway + auto scale-in
 """
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import List, Optional
 import logging
 import pandas as pd
-
 import sys
 import os
-# ai/ 디렉토리를 path에 추가
+import time
+import threading
+import requests
+from datetime import datetime
+
 _AI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 sys.path.insert(0, _AI_DIR)
-# ForeScale 루트(recovery/ 등)를 path에 추가 (ai-vm 기준 /home/ubuntu/ForeScale/)
 _ROOT_DIR = os.path.join(_AI_DIR, '..')
 sys.path.insert(0, _ROOT_DIR)
 
 from model.predictor import Predictor
 from model.spike_detector import SpikeDetector
 from api.alert_sender import AlertSender
-from recovery.provisioner import scale_out
+from recovery.provisioner import scale_out, scale_in, get_recovery_vms
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title='ForeScale AI Inference API', version='3.0.0')
+app = FastAPI(title='ForeScale AI Inference API', version='5.2.0')
 
-# ============================================================
-# 설정값 (운영에서 조정)
-# ============================================================
 CONFIG = {
-    'cpu_threshold': 80.0,           # CPU % 임계치
-    'traffic_threshold': 30 * 1024,  # Traffic bytes/s 임계치
-    'spike_threshold_pct': 30.0,     # 급격 감지 변화율 임계치
-    'spike_baseline_window': 5,      # 급격 감지 baseline 윈도우 크기
-    'predict_minutes': 3,            # 몇 분 뒤 예측
-    'd_team_url': 'http://10.0.2.40:8080/api/v1/alerts/scale-out',
+    'cpu_threshold':          80.0,
+    'traffic_threshold':      30 * 1024,
+    'spike_threshold_pct':    30.0,
+    'spike_baseline_window':  5,
+    'predict_minutes':        3,
+    'd_team_url':             'http://10.0.2.40:8080/api/v1/alerts/scale-out',
+    'prometheus_url':         'http://10.0.2.202:9090',
+    'pushgateway_url':        'http://10.0.2.148:9091',
+    'target_instance':        '10.0.2.40:9100',
+    'source_instance_id':     'i-03512866b1c1ba03e',
+    'scheduler_interval_sec': 60,
+    'stable_threshold':       5,
 }
 
-# 전역 인스턴스 (요청마다 새로 만들지 않고 재사용)
 sender = AlertSender(d_team_url=CONFIG['d_team_url'])
 spike_detector = SpikeDetector(
     threshold_pct=CONFIG['spike_threshold_pct'],
     baseline_window=CONFIG['spike_baseline_window'],
 )
 
-
-# ============================================================
-# 요청/응답 스키마
-# ============================================================
-class TimeseriesPoint(BaseModel):
-    ds: str = Field(..., description='ISO 8601 timestamp, e.g. 2026-05-11T14:23:00Z')
-    y: float = Field(..., description='해당 시점의 메트릭 값')
+_scaling_lock  = threading.Lock()
+_is_scaling    = False
+stable_counter = 0
 
 
-class PredictRequest(BaseModel):
-    """
-    /predict 요청
-    - cpu_series: CPU 사용률 시계열 (%)
-    - traffic_series: 트래픽 시계열 (bytes/s)
-    - source_instance_id: 알람 발생 EC2 ID (옵션)
-    """
-    cpu_series: List[TimeseriesPoint]
-    traffic_series: List[TimeseriesPoint]
-    source_instance_id: Optional[str] = None
-
-
-class PredictResponse(BaseModel):
-    """
-    /predict 응답 (디버깅/모니터링용 — 어떤 판단을 했는지 투명하게 공개)
-    """
-    # Prophet 예측 결과
-    pred_cpu: float
-    pred_traffic: float
-    cpu_trigger: bool
-    traffic_trigger: bool
-    # 급격 감지 결과
-    spike_cpu: bool
-    spike_traffic: bool
-    # 최종 OR 트리거
-    any_trigger: bool
-    # 사유 (Grafana 어노테이션에 표시)
-    reason: str
-    # 알람 전송 결과 (D팀에서 받은 응답)
-    alerts_sent: List[dict]
-
-
-# ============================================================
-# 엔드포인트
-# ============================================================
-@app.get('/health')
-def health():
-    return {'status': 'ok', 'version': '3.0.0'}
-
-
-@app.post('/predict', response_model=PredictResponse)
-def predict(req: PredictRequest):
-    """
-    핵심 엔드포인트:
-      1. Prophet 두 모델 학습/추론
-      2. 급격 감지 병행
-      3. OR 조건으로 트리거 결정
-      4. 위험하면 D팀에 자동 알람 전송
-    """
-    # ---- 입력 검증 ----
-    if len(req.cpu_series) < 10 or len(req.traffic_series) < 10:
-        raise HTTPException(
-            status_code=400,
-            detail='cpu_series and traffic_series each need >= 10 points'
+def push_metrics(pred_cpu, pred_traffic, any_trigger):
+    try:
+        metrics = (
+            'forescale_pred_cpu '    + str(pred_cpu)          + '\n'
+            'forescale_pred_traffic '+ str(pred_traffic)      + '\n'
+            'forescale_any_trigger ' + str(int(any_trigger))  + '\n'
         )
+        requests.post(
+            CONFIG['pushgateway_url'] + '/metrics/job/forescale',
+            data=metrics,
+            timeout=3,
+        )
+        logger.info('[Pushgateway] 예측값 push 완료')
+    except Exception as e:
+        logger.error('[Pushgateway] push 실패: ' + str(e))
 
-    # ---- DataFrame 변환 ----
-    cpu_df = pd.DataFrame([{'ds': p.ds, 'y': p.y} for p in req.cpu_series])
+
+def fetch_prometheus_data():
+    end   = int(time.time())
+    start = end - 600
+
+    try:
+        r = requests.get(CONFIG['prometheus_url'] + '/api/v1/query_range', params={
+            'query': '100-(avg by(instance)(rate(node_cpu_seconds_total{mode="idle",instance="' + CONFIG['target_instance'] + '"}[1m]))*100)',
+            'start': start, 'end': end, 'step': '60'
+        }, timeout=5)
+        cpu_vals = r.json()['data']['result'][0]['values']
+
+        tr = requests.get(CONFIG['prometheus_url'] + '/api/v1/query_range', params={
+            'query': 'rate(node_network_receive_bytes_total{instance="' + CONFIG['target_instance'] + '",device="ens5"}[1m])',
+            'start': start, 'end': end, 'step': '60'
+        }, timeout=5)
+        t_vals = tr.json()['data']['result'][0]['values']
+
+        n = min(len(cpu_vals), len(t_vals))
+        if n < 10:
+            logger.warning('[Scheduler] 데이터 포인트 부족: ' + str(n))
+            return None, None
+
+        cpu_series     = [{'ds': datetime.utcfromtimestamp(cpu_vals[i][0]).strftime('%Y-%m-%dT%H:%M:%S'), 'y': float(cpu_vals[i][1])}for i in range(n)]
+        traffic_series = [{'ds': datetime.utcfromtimestamp(t_vals[i][0]).strftime('%Y-%m-%dT%H:%M:%S'),   'y': float(t_vals[i][1])}for i in range(n)]
+        return cpu_series, traffic_series
+
+    except Exception as e:
+        logger.error('[Scheduler] Prometheus 조회 실패: ' + str(e))
+        return None, None
+
+
+def run_predict_job():
+    global _is_scaling, stable_counter
+
+    with _scaling_lock:
+        if _is_scaling:
+            logger.info('[Scheduler] 이미 scale_out 진행 중 — 스킵')
+            return
+
+    logger.info('[Scheduler] Prometheus 데이터 조회 중...')
+    cpu_series, traffic_series = fetch_prometheus_data()
+    if cpu_series is None:
+        return
+
+    cpu_df = pd.DataFrame(cpu_series)
     cpu_df['ds'] = pd.to_datetime(cpu_df['ds'])
-    traffic_df = pd.DataFrame([{'ds': p.ds, 'y': p.y} for p in req.traffic_series])
+    traffic_df = pd.DataFrame(traffic_series)
     traffic_df['ds'] = pd.to_datetime(traffic_df['ds'])
 
-    # ---- 1) Prophet 병렬 추론 ----
     predictor = Predictor(
         cpu_threshold=CONFIG['cpu_threshold'],
         traffic_threshold=CONFIG['traffic_threshold'],
@@ -144,55 +130,183 @@ def predict(req: PredictRequest):
     predictor.fit_traffic(traffic_df)
     pred_result = predictor.predict_all(predict_minutes=CONFIG['predict_minutes'])
 
-    # ---- 2) 급격 감지 병행 ----
-    cpu_spike = spike_detector.check(cpu_df['y'].tolist())
+    cpu_spike     = spike_detector.check(cpu_df['y'].tolist())
     traffic_spike = spike_detector.check(traffic_df['y'].tolist())
 
-    # ---- 3) OR 트리거 결정 ----
-    any_trigger = bool(
-        pred_result['any_trigger']
-        or cpu_spike['spike']
-        or traffic_spike['spike']
-    )
+    if cpu_spike['current'] < CONFIG['cpu_threshold']:
+        cpu_spike['spike'] = False
+    if traffic_spike['current'] < CONFIG['traffic_threshold']:
+        traffic_spike['spike'] = False
 
-    # 사유 조립
+    any_trigger = bool(pred_result['any_trigger'] or cpu_spike['spike'] or traffic_spike['spike'])
+
     reasons = []
     if pred_result['cpu']['trigger']:
-        reasons.append(f'[Prophet-CPU] {pred_result["cpu"]["reason"]}')
+        reasons.append('[Prophet-CPU] ' + pred_result['cpu']['reason'])
     if pred_result['traffic']['trigger']:
-        reasons.append(f'[Prophet-TRAFFIC] {pred_result["traffic"]["reason"]}')
+        reasons.append('[Prophet-TRAFFIC] ' + pred_result['traffic']['reason'])
     if cpu_spike['spike']:
-        reasons.append(f'[Spike-CPU] {cpu_spike["reason"]}')
+        reasons.append('[Spike-CPU] ' + cpu_spike['reason'])
     if traffic_spike['spike']:
-        reasons.append(f'[Spike-TRAFFIC] {traffic_spike["reason"]}')
+        reasons.append('[Spike-TRAFFIC] ' + traffic_spike['reason'])
     reason_text = ' | '.join(reasons) if reasons else 'all normal'
 
-    logger.info(f'[/predict] any_trigger={any_trigger} | {reason_text}')
+    logger.info('[Scheduler] any_trigger=' + str(any_trigger) + ' | ' + reason_text)
 
-    # ---- 4) 위험 시 직접 scale_out() 호출 → 완료 후 D팀 결과 통보 ----
+    push_metrics(pred_result['cpu']['pred_value'], pred_result['traffic']['pred_value'], any_trigger)
+
+    if any_trigger:
+        stable_counter = 0
+        with _scaling_lock:
+            _is_scaling = True
+        try:
+            scale_out_result = scale_out(reason=reason_text)
+            sender.notify(
+                pred_result=pred_result,
+                scale_out_result=scale_out_result,
+                source_instance_id=CONFIG['source_instance_id'],
+            )
+            logger.info('[Scheduler] scale_out + D팀 알람 완료')
+        except Exception as e:
+            logger.error('[Scheduler] scale_out 실패: ' + str(e))
+        finally:
+            with _scaling_lock:
+                _is_scaling = False
+
+    else:
+        stable_counter += 1
+        logger.info('[Scheduler] 안정 카운터: ' + str(stable_counter) + '/' + str(CONFIG['stable_threshold']))
+
+        if stable_counter >= CONFIG['stable_threshold']:
+            recovery_vms = get_recovery_vms()
+            if recovery_vms:
+                logger.info('[Scheduler] scale_in 실행: ' + str(len(recovery_vms)) + '대')
+                for vm in recovery_vms:
+                    try:
+                        scale_in(vm['instance_id'])
+                        logger.info('[Scheduler] scale_in 완료: ' + vm['instance_id'])
+                    except Exception as e:
+                        logger.error('[Scheduler] scale_in 실패: ' + str(e))
+            else:
+                logger.info('[Scheduler] recovery VM 없음, scale_in 스킵')
+            stable_counter = 0
+
+
+def start_scheduler():
+    def loop():
+        while True:
+            try:
+                run_predict_job()
+            except Exception as e:
+                logger.error('[Scheduler] 예외: ' + str(e))
+            time.sleep(CONFIG['scheduler_interval_sec'])
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+    logger.info('[Scheduler] 시작 — 60초 간격으로 실행')
+
+
+@app.on_event('startup')
+def on_startup():
+    start_scheduler()
+
+
+@app.get('/health')
+def health():
+    return {
+        'status':         'ok',
+        'version':        '5.2.0',
+        'scheduler':      'running',
+        'stable_counter': stable_counter,
+    }
+
+
+class TimeseriesPoint(BaseModel):
+    ds: str
+    y:  float
+
+
+class PredictRequest(BaseModel):
+    cpu_series:         List[TimeseriesPoint]
+    traffic_series:     List[TimeseriesPoint]
+    source_instance_id: Optional[str] = None
+
+
+class PredictResponse(BaseModel):
+    pred_cpu:        float
+    pred_traffic:    float
+    cpu_trigger:     bool
+    traffic_trigger: bool
+    spike_cpu:       bool
+    spike_traffic:   bool
+    any_trigger:     bool
+    reason:          str
+    alerts_sent:     List[dict]
+
+
+@app.post('/predict', response_model=PredictResponse)
+def predict(req: PredictRequest):
+    if len(req.cpu_series) < 10 or len(req.traffic_series) < 10:
+        raise HTTPException(status_code=400, detail='cpu_series and traffic_series each need >= 10 points')
+
+    cpu_df = pd.DataFrame([{'ds': p.ds, 'y': p.y} for p in req.cpu_series])
+    cpu_df['ds'] = pd.to_datetime(cpu_df['ds'])
+    traffic_df = pd.DataFrame([{'ds': p.ds, 'y': p.y} for p in req.traffic_series])
+    traffic_df['ds'] = pd.to_datetime(traffic_df['ds'])
+
+    predictor = Predictor(
+        cpu_threshold=CONFIG['cpu_threshold'],
+        traffic_threshold=CONFIG['traffic_threshold'],
+    )
+    predictor.fit_cpu(cpu_df)
+    predictor.fit_traffic(traffic_df)
+    pred_result = predictor.predict_all(predict_minutes=CONFIG['predict_minutes'])
+
+    cpu_spike     = spike_detector.check(cpu_df['y'].tolist())
+    traffic_spike = spike_detector.check(traffic_df['y'].tolist())
+
+    if cpu_spike['current'] < CONFIG['cpu_threshold']:
+        cpu_spike['spike'] = False
+    if traffic_spike['current'] < CONFIG['traffic_threshold']:
+        traffic_spike['spike'] = False
+
+    any_trigger = bool(pred_result['any_trigger'] or cpu_spike['spike'] or traffic_spike['spike'])
+
+    reasons = []
+    if pred_result['cpu']['trigger']:
+        reasons.append('[Prophet-CPU] ' + pred_result['cpu']['reason'])
+    if pred_result['traffic']['trigger']:
+        reasons.append('[Prophet-TRAFFIC] ' + pred_result['traffic']['reason'])
+    if cpu_spike['spike']:
+        reasons.append('[Spike-CPU] ' + cpu_spike['reason'])
+    if traffic_spike['spike']:
+        reasons.append('[Spike-TRAFFIC] ' + traffic_spike['reason'])
+    reason_text = ' | '.join(reasons) if reasons else 'all normal'
+
+    push_metrics(pred_result['cpu']['pred_value'], pred_result['traffic']['pred_value'], any_trigger)
+    logger.info('[/predict] any_trigger=' + str(any_trigger) + ' | ' + reason_text)
+
     alerts_sent = []
     if any_trigger:
         try:
             scale_out_result = scale_out(reason=reason_text)
-            logger.info(f'[/predict] scale_out completed: {scale_out_result}')
             alerts_sent = [sender.notify(
                 pred_result=pred_result,
                 scale_out_result=scale_out_result,
                 source_instance_id=req.source_instance_id,
             )]
         except Exception as e:
-            logger.error(f'[/predict] scale_out failed: {e}')
+            logger.error('[/predict] scale_out 실패: ' + str(e))
             alerts_sent = [{'status': 'SCALE_OUT_FAILED', 'reason': str(e)}]
 
-    # ---- 5) 응답 ----
     return PredictResponse(
-        pred_cpu=pred_result['cpu']['pred_value'],
-        pred_traffic=pred_result['traffic']['pred_value'],
-        cpu_trigger=pred_result['cpu']['trigger'],
-        traffic_trigger=pred_result['traffic']['trigger'],
-        spike_cpu=cpu_spike['spike'],
-        spike_traffic=traffic_spike['spike'],
-        any_trigger=any_trigger,
-        reason=reason_text,
-        alerts_sent=alerts_sent,
+        pred_cpu        = pred_result['cpu']['pred_value'],
+        pred_traffic    = pred_result['traffic']['pred_value'],
+        cpu_trigger     = pred_result['cpu']['trigger'],
+        traffic_trigger = pred_result['traffic']['trigger'],
+        spike_cpu       = cpu_spike['spike'],
+        spike_traffic   = traffic_spike['spike'],
+        any_trigger     = any_trigger,
+        reason          = reason_text,
+        alerts_sent     = alerts_sent,
     )
