@@ -1,48 +1,4 @@
 """
-Predictor: CPU + Traffic 병렬 추론 통합 클래스
-
-CPU(Prophet_CPU)와 Traffic(Prophet_Traffic)을 동시에 돌려서
-하나의 결과로 모아주는 모듈.
-
-사용 예:
-    predictor = Predictor()
-    predictor.fit_cpu(cpu_df)
-    predictor.fit_traffic(traffic_df)
-    result = predictor.predict_all(predict_minutes=3)
-    # result = {
-    #   'cpu':     {pred_value, threshold, trigger, reason, ...},
-    #   'traffic': {pred_value, threshold, trigger, reason, ...},
-    #   'any_trigger': True/False,
-    # }
-"""
-
-import pandas as pd
-from prophet import Prophet
-ubuntu@ip-10-0-2-148:~/ForeScale/ai/model$ grep -n "stable\|counter\|shutdown\|terminate\|scale_in\|헬스" ~/ForeScale/ai/api/main.py
-26:from recovery.provisioner import scale_out, scale_in, get_recovery_vms
-45:    'stable_threshold':       5,
-56:stable_counter = 0
-108:    global _is_scaling, stable_counter
-159:        stable_counter = 0
-177:        stable_counter += 1
-178:        logger.info('[Scheduler] 안정 카운터: ' + str(stable_counter) + '/' + str(CONFIG['stable_threshold']))
-180:        if stable_counter >= CONFIG['stable_threshold']:
-183:                logger.info('[Scheduler] scale_in 실행: ' + str(len(recovery_vms)) + '대')
-186:                        scale_in(vm['instance_id'])
-187:                        logger.info('[Scheduler] scale_in 완료: ' + vm['instance_id'])
-189:                        logger.error('[Scheduler] scale_in 실패: ' + str(e))
-191:                logger.info('[Scheduler] recovery VM 없음, scale_in 스킵')
-192:            stable_counter = 0
-220:        'stable_counter': stable_counter,
-ubuntu@ip-10-0-2-148:~/ForeScale/ai/model$ cd ~/ForeScale && git remote -v && git config user.name && git config user.email
-origin  https://github.com/imHaiHye/ForeScale.git (fetch)
-origin  https://github.com/imHaiHye/ForeScale.git (push)
-ubuntu@ip-10-0-2-148:~/ForeScale$ git config user.name "imHaiHye"
-error: could not lock config file .git/config: Permission denied
-ubuntu@ip-10-0-2-148:~/ForeScale$ ^C
-ubuntu@ip-10-0-2-148:~/ForeScale$-148:~/ForeScaleubuntu@ip-10-0-2-148:~/ForeScale$-148:~/ForeScaleubuntu@ip-10-0-2-148:~/ForeScale$ ^C
-ubuntu@ip-10-0-2-148:~/ForeScale$ cat ~/ForeScale/ai/api/main.py
-"""
 FastAPI 서버 (최종 통합본)
 # v5.2.0 — threading 스케줄러 + Prometheus + Pushgateway + auto scale-in
 """
@@ -139,8 +95,8 @@ def fetch_prometheus_data():
             logger.warning('[Scheduler] 데이터 포인트 부족: ' + str(n))
             return None, None
 
-        cpu_series     = [{'ds': datetime.utcfromtimestamp(cpu_vals[i][0]).strftime('%Y-%m-%dT%H:%M:%S'), 'y': float(cpu_vals[i][1])} for i in range(n)]
-        traffic_series = [{'ds': datetime.utcfromtimestamp(t_vals[i][0]).strftime('%Y-%m-%dT%H:%M:%S'),   'y': float(t_vals[i][1])}  for i in range(n)]
+        cpu_series     = [{'ds': datetime.utcfromtimestamp(cpu_vals[i][0]).strftime('%Y-%m-%dT%H:%M:%S'), 'y': float(cpu_vals[i][1])}for i in range(n)]
+        traffic_series = [{'ds': datetime.utcfromtimestamp(t_vals[i][0]).strftime('%Y-%m-%dT%H:%M:%S'),   'y': float(t_vals[i][1])}for i in range(n)]
         return cpu_series, traffic_series
 
     except Exception as e:
@@ -195,7 +151,7 @@ def run_predict_job():
         reasons.append('[Spike-TRAFFIC] ' + traffic_spike['reason'])
     reason_text = ' | '.join(reasons) if reasons else 'all normal'
 
-    logger.info('[Scheduler] any_trigger=' + str(any_trigger) + '| ' + reason_text)
+    logger.info('[Scheduler] any_trigger=' + str(any_trigger) + ' | ' + reason_text)
 
     push_metrics(pred_result['cpu']['pred_value'], pred_result['traffic']['pred_value'], any_trigger)
 
@@ -228,7 +184,7 @@ def run_predict_job():
                 for vm in recovery_vms:
                     try:
                         scale_in(vm['instance_id'])
-                        logger.info('[Scheduler] scale_in 완료: '+ vm['instance_id'])
+                        logger.info('[Scheduler] scale_in 완료: ' + vm['instance_id'])
                     except Exception as e:
                         logger.error('[Scheduler] scale_in 실패: ' + str(e))
             else:
