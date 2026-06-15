@@ -94,7 +94,7 @@ pkill -f forescale-backend-0.0.1-SNAPSHOT.jar
 
 ```yaml
 global:
-  scrape_interval: 10s        # 10초마다 메트릭 수집
+  scrape_interval: 10s
   evaluation_interval: 10s
 
 scrape_configs:
@@ -102,7 +102,11 @@ scrape_configs:
     file_sd_configs:
       - files:
           - '/opt/prometheus/file_sd.json'
-        refresh_interval: 15s  # 15초마다 파일 변경사항 감지
+        refresh_interval: 15s
+  - job_name: 'pushgateway'
+    honor_labels: true
+    static_configs:
+      - targets: ['10.0.2.148:9091']
 ```
 
 ### file_sd.json
