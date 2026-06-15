@@ -1,7 +1,7 @@
-# 📊 Viral-Guard — B팀 (Data) 작업 문서
+# 📊 Viral-Guard — Data
 
 ## 팀 정보
-- **팀원:** 최정연 (B팀 · Data)
+- **팀원:** 최정연 
 - **역할:** 메트릭 수집 인프라 구축 및 부하 테스트 시나리오 설계
 
 ---
@@ -159,29 +159,3 @@ scrape_configs:
 # 네트워크 트래픽 유입량 (초당 바이트)
 rate(node_network_receive_bytes_total{device="ens5"}[1m])
 ```
-
----
-
-## 4. 주차별 완료 현황
-
-| 주차 | 작업 | 상태 |
-|---|---|---|
-| 1주차 | Prometheus 셋업, Node Exporter 설치 | ✅ 완료 |
-| 1주차 | JMeter 설치 및 시나리오 작성 | ✅ 완료 |
-| 2주차 | JMeter 실부하 테스트 실행 | ✅ 완료 |
-| 2주차 | CSV 데이터 C팀 전달 | ✅ 완료 |
-| 3주차 | 트래픽 메트릭 수집 확인 | ✅ 완료 |
-| 5-6주차 | Grafana 대시보드 완성 | 🔜 예정 |
-
----
-
-## 5. 타 팀 연동 사항
-
-### A팀 (IaaS)
-- EC2 보안 그룹 포트 오픈 필요: `9100` (Node Exporter), `9090` (Prometheus)
-- `file_sd.json` 경로: `/opt/prometheus/file_sd.json`
-- boto3 Scale-out 시 이 파일에 신규 EC2 IP 자동 추가 필요
-
-### C팀 (AI)
-- JMeter CSV 결과 파일 전달 완료 (`sudden_traffic.csv`)
-- Prometheus 쿼리로 실시간 메트릭 접근 가능: `http://10.0.2.202:9090`
