@@ -227,6 +227,15 @@ resource "aws_security_group" "monitoring" {
     security_groups = [aws_security_group.alb.id]
   }
 
+  # 프라이빗 서브넷 내부에서 직접 접근
+  ingress {
+    description = "Grafana from private subnet"
+    from_port   = 3000
+    to_port     = 3000
+    protocol    = "tcp"
+    cidr_blocks = [var.private_subnet_cidr]
+  }
+
   # SSH - 디버깅용
   ingress {
     description = "SSH from private subnet"
@@ -272,6 +281,15 @@ resource "aws_security_group" "ai_vm" {
     to_port     = 22
     protocol    = "tcp"
     cidr_blocks = [var.private_subnet_cidr]
+  }
+
+  # 추가 - 모니터링 VM에서 9091 접근
+  ingress {
+    description     = "Port 9091 from monitoring VM"
+    from_port       = 9091
+    to_port         = 9091
+    protocol        = "tcp"
+    security_groups = [aws_security_group.monitoring.id]
   }
 
   # 아웃바운드 전체 허용 (boto3 AWS API 호출, Prometheus 쿼리)
