@@ -1,0 +1,14 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: 'node_dynamic'
+    file_sd_configs:
+      - files:
+          - '/opt/prometheus/file_sd.json'
+        refresh_interval: 15s
+  - job_name: 'pushgateway'
+    honor_labels: true
+    static_configs:
+      - targets: ['10.0.2.148:9091']
